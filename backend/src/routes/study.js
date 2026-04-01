@@ -40,8 +40,17 @@ router.post("/analyze", async (req, res) => {
     });
     return res.status(201).json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to analyze source";
-    const status = message.includes("timed out") ? 504 : 400;
+    let message = error instanceof Error ? error.message : "Failed to analyze source";
+    let status = message.includes("timed out") ? 504 : 400;
+    if (
+      message.includes("ECONNRESET") ||
+      message.includes("socket hang up") ||
+      message.includes("Network Error") ||
+      message.includes("ENOTFOUND")
+    ) {
+      status = 502;
+      message = "Temporary network error while contacting external services. Please retry.";
+    }
     logger.error("Analyze request failed", {
       requestId,
       status,

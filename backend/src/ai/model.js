@@ -15,6 +15,7 @@ const GEMINI_MODEL_FALLBACKS = [
   "gemini-1.5-flash-latest",
   "gemini-1.5-flash"
 ];
+const MAX_GEMINI_RETRIES = 3;
 
 function requireGeminiKey() {
   if (!config.geminiApiKey) {
@@ -46,6 +47,39 @@ function buildGeminiError(error) {
   return new Error(`Gemini API error (${status || "n/a"}): ${apiMessage}`);
 }
 
+function shouldRetryGeminiError(error) {
+  const code = error?.code || error?.cause?.code;
+  const status = error?.response?.status;
+  return (
+    ["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "EAI_AGAIN", "ENOTFOUND"].includes(code) ||
+    status === 429 ||
+    (typeof status === "number" && status >= 500)
+  );
+}
+
+async function postGeminiWithRetry({ url, body, headers, model, baseUrl }) {
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_GEMINI_RETRIES; attempt += 1) {
+    try {
+      if (attempt > 1) {
+        logger.warn("Retrying Gemini call", { baseUrl, model, attempt, maxRetries: MAX_GEMINI_RETRIES });
+      }
+      return await axios.post(url, body, {
+        headers,
+        timeout: LLM_TIMEOUT_MS
+      });
+    } catch (error) {
+      lastError = error;
+      if (!shouldRetryGeminiError(error) || attempt === MAX_GEMINI_RETRIES) {
+        throw error;
+      }
+      const waitMs = attempt * 700;
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+  throw lastError;
+}
+
 async function callGemini({ systemPrompt, userPrompt, responseMimeType }) {
   const models = buildModelCandidates();
   let lastError = null;
@@ -54,9 +88,9 @@ async function callGemini({ systemPrompt, userPrompt, responseMimeType }) {
     for (const model of models) {
       try {
         logger.debug("Trying Gemini endpoint", { baseUrl, model });
-        const response = await axios.post(
-          `${baseUrl}/models/${model}:generateContent?key=${config.geminiApiKey}`,
-          {
+        const response = await postGeminiWithRetry({
+          url: `${baseUrl}/models/${model}:generateContent?key=${config.geminiApiKey}`,
+          body: {
             systemInstruction: {
               parts: [{ text: systemPrompt }]
             },
@@ -71,11 +105,10 @@ async function callGemini({ systemPrompt, userPrompt, responseMimeType }) {
               ...(responseMimeType ? { responseMimeType } : {})
             }
           },
-          {
-            headers: { "Content-Type": "application/json" },
-            timeout: LLM_TIMEOUT_MS
-          }
-        );
+          headers: { "Content-Type": "application/json" },
+          model,
+          baseUrl
+        });
 
         logger.debug("Gemini endpoint succeeded", { baseUrl, model });
         return response;

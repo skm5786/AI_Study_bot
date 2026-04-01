@@ -11,6 +11,7 @@ import { getOpenAIClient } from "./model.js";
 import { logger } from "../utils/logger.js";
 
 const HTTP_TIMEOUT_MS = 30000;
+const MAX_HTTP_RETRIES = 3;
 
 const TEXT_FILE_EXTENSIONS = new Set([
   ".txt",
@@ -32,38 +33,75 @@ function trimToLimit(text) {
   return text.slice(0, config.maxSourceChars);
 }
 
+function shouldRetryNetworkError(error) {
+  const code = error?.code || error?.cause?.code;
+  const status = error?.response?.status;
+  return (
+    ["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "EAI_AGAIN", "ENOTFOUND"].includes(code) ||
+    status === 429 ||
+    (typeof status === "number" && status >= 500)
+  );
+}
+
+async function withHttpRetry(fn, label) {
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_HTTP_RETRIES; attempt += 1) {
+    try {
+      if (attempt > 1) {
+        logger.warn("Retrying HTTP call", { label, attempt, maxRetries: MAX_HTTP_RETRIES });
+      }
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (!shouldRetryNetworkError(error) || attempt === MAX_HTTP_RETRIES) {
+        throw error;
+      }
+      const waitMs = attempt * 700;
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+  throw lastError;
+}
+
 async function fetchTextFromUrl(url) {
-  const response = await axios.get(url, {
-    responseType: "text",
-    maxContentLength: config.maxFileSizeMb * 1024 * 1024,
-    timeout: HTTP_TIMEOUT_MS,
-    maxRedirects: 5
-  });
+  const response = await withHttpRetry(
+    () =>
+      axios.get(url, {
+        responseType: "text",
+        maxContentLength: config.maxFileSizeMb * 1024 * 1024,
+        timeout: HTTP_TIMEOUT_MS,
+        maxRedirects: 5
+      }),
+    "fetchTextFromUrl"
+  );
   return response.data;
 }
 
 async function fetchBufferFromUrl(url) {
-  const response = await axios.get(url, {
-    responseType: "arraybuffer",
-    maxContentLength: config.maxFileSizeMb * 1024 * 1024,
-    timeout: HTTP_TIMEOUT_MS,
-    maxRedirects: 5
-  });
+  const response = await withHttpRetry(
+    () =>
+      axios.get(url, {
+        responseType: "arraybuffer",
+        maxContentLength: config.maxFileSizeMb * 1024 * 1024,
+        timeout: HTTP_TIMEOUT_MS,
+        maxRedirects: 5
+      }),
+    "fetchBufferFromUrl"
+  );
   return Buffer.from(response.data);
 }
 
-function extractTextFromHtml(html) {
-  const $ = load(html);
-  $("script, style, noscript").remove();
-
-  const title = $("title").first().text().trim();
-  const mainText = $("body").text().replace(/\s+/g, " ").trim();
-  return { title, text: mainText };
-}
-
-function isDirectMediaUrl(url) {
-  const ext = extname(new URL(url).pathname).toLowerCase();
-  return [".mp3", ".wav", ".m4a", ".ogg", ".mp4", ".mov", ".webm"].includes(ext);
+async function fetchStreamFromUrl(url) {
+  return withHttpRetry(
+    () =>
+      axios.get(url, {
+        responseType: "stream",
+        maxContentLength: config.maxFileSizeMb * 1024 * 1024,
+        timeout: HTTP_TIMEOUT_MS,
+        maxRedirects: 5
+      }),
+    "fetchStreamFromUrl"
+  );
 }
 
 async function transcribeMediaUrl(url) {
@@ -76,12 +114,7 @@ async function transcribeMediaUrl(url) {
   const tempPath = resolve(tmpdir(), `${randomUUID()}${ext}`);
 
   try {
-    const response = await axios.get(url, {
-      responseType: "stream",
-      maxContentLength: config.maxFileSizeMb * 1024 * 1024,
-      timeout: HTTP_TIMEOUT_MS,
-      maxRedirects: 5
-    });
+    const response = await fetchStreamFromUrl(url);
 
     await new Promise((resolveWrite, rejectWrite) => {
       const writer = createWriteStream(tempPath);
@@ -103,6 +136,20 @@ async function transcribeMediaUrl(url) {
       // ignore cleanup failures
     }
   }
+}
+
+function extractTextFromHtml(html) {
+  const $ = load(html);
+  $("script, style, noscript").remove();
+
+  const title = $("title").first().text().trim();
+  const mainText = $("body").text().replace(/\s+/g, " ").trim();
+  return { title, text: mainText };
+}
+
+function isDirectMediaUrl(url) {
+  const ext = extname(new URL(url).pathname).toLowerCase();
+  return [".mp3", ".wav", ".m4a", ".ogg", ".mp4", ".mov", ".webm"].includes(ext);
 }
 
 async function extractFromImage(url) {
