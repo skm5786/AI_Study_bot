@@ -1,0 +1,20 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: "Inter", "Segoe UI", Roboto, sans-serif;
+}
+
+body {
+  @apply bg-bg text-text min-h-screen;
+}
+
+input,
+textarea {
+  @apply bg-panelSoft border border-border text-text placeholder:text-muted;
+}
+
+button:disabled {
+  @apply opacity-60 cursor-not-allowed;
+}
